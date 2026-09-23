@@ -1,0 +1,46 @@
+name: Build Injector (x64)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC x64 toolchain
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Assemble syscalls-asm.x64.asm (MASM x64)
+        shell: cmd
+        run: ml64 /c /nologo /Fo syscalls-asm.obj syscalls-asm.x64.asm
+
+      - name: Compile syscalls.c
+        shell: cmd
+        run: cl /c /O2 /GS- /nologo /W3 /Fo:syscalls.obj syscalls.c
+
+      - name: Compile injector.cpp
+        shell: cmd
+        run: cl /c /O2 /GS- /nologo /W3 /Fo:injector.obj injector.cpp
+
+      - name: Link injector.exe
+        shell: cmd
+        run: >
+          link /nologo /OUT:injector.exe /SUBSYSTEM:CONSOLE
+          injector.obj syscalls.obj syscalls-asm.obj
+          advapi32.lib
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: injector-x64
+          path: injector.exe
+          if-no-files-found: error
