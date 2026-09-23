@@ -31,10 +31,11 @@ jobs:
         shell: cmd
         run: cl /c /O2 /GS- /nologo /W3 /Fo:injector.obj injector.cpp
 
-      - name: Link injector.exe
+      - name: Link injector.exe (silent, no console)
         shell: cmd
         run: >
-          link /nologo /OUT:injector.exe /SUBSYSTEM:CONSOLE
+          link /nologo /OUT:injector.exe
+          /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup
           injector.obj syscalls.obj syscalls-asm.obj
           advapi32.lib
 
